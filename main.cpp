@@ -13,6 +13,16 @@
 #include <pcl/common/pca.h>
 #include <pcl/kdtree/kdtree_flann.h>
 #include <pcl/filters/random_sample.h>
+// CGAL
+#include <CGAL/Exact_predicates_inexact_constructions_kernel.h>
+#include <CGAL/Delaunay_triangulation_2.h>
+#include <CGAL/Triangulation_vertex_base_with_info_2.h>
+
+typedef CGAL::Exact_predicates_inexact_constructions_kernel Kernel;
+typedef CGAL::Triangulation_vertex_base_with_info_2<unsigned int, Kernel> Vb;
+typedef CGAL::Triangulation_data_structure_2<Vb> Tds;
+typedef CGAL::Delaunay_triangulation_2<Kernel, Tds> Delaunay;
+typedef Kernel::Point_2 Point;
 
 /// 读取las文件，为了避免大数值坐标的影响，进行偏移
 /// \param las_path las文件路径
@@ -74,6 +84,59 @@ struct HashArray2I
 	}
 };
 
+/// 高程内插
+/// \param pt 待插入点
+/// \param cloud
+/// \param elv 插值高程
+/// \return
+bool Ele_interpolation(pcl::PointXYZ pt, pcl::PointCloud<pcl::PointXYZ>::Ptr cloud, float& elv)
+{
+	if (cloud->size() < 3)
+	{
+		return false;
+	}
+
+	// 三角网构建
+	std::vector<std::pair<Point, unsigned>> points;
+	for (int i = 0; i < cloud->size(); i++)
+		points.push_back(std::make_pair(Point(cloud->points[i].x, cloud->points[i].y), i));
+
+	Delaunay dt;
+	dt.insert(points.begin(), points.end());
+
+	// 定位点pt所在三角形
+	int li = 0;
+	Delaunay::Locate_type lt;
+	Delaunay::Face_handle loc;
+	loc = dt.locate(Point(pt.x, pt.y), lt, li);
+
+	// 三角面片的三个顶点
+	auto idx0 = loc->vertex(0)->info();
+	auto idx1 = loc->vertex(1)->info();
+	auto idx2 = loc->vertex(2)->info();
+
+	if (idx0 < cloud->size() - 1 && idx1 < cloud->size() - 1 && idx2 < cloud->size() - 1)
+	{
+		auto p0 = cloud->points[idx0];
+		auto p1 = cloud->points[idx1];
+		auto p2 = cloud->points[idx2];
+		// 高程内插
+		float areaABC = 0.5 * ((p1.x - p0.x) * (p2.y - p0.y) - (p2.x - p0.x) * (p1.y - p0.y));
+		float areaPBC = 0.5 * ((p1.x - pt.x) * (p2.y - pt.y) - (p2.x - pt.x) * (p1.y - pt.y));
+		float areaPCA = 0.5 * ((pt.x - p0.x) * (p2.y - p0.y) - (p2.x - p0.x) * (pt.y - p0.y));
+
+		double alpha = areaPBC / areaABC;
+		double beta = areaPCA / areaABC;
+		double gamma = 1 - alpha - beta;
+
+		elv = alpha * p0.z + beta * p1.z + gamma * p2.z;
+
+		return true;
+	}
+	else
+		return false;
+}
+
 /// 输入为：相邻两航带点云数据
 /// 1、计算两条航带各自覆盖面积及点密度
 /// 2、计算两条航带最小及最小重叠
@@ -86,7 +149,7 @@ bool Quality_Check(pcl::PointCloud<pcl::PointXYZ>::Ptr flight1, pcl::PointCloud<
 	// 将两航带数据融合，计算航线方向，并以航线方向为X轴，垂直于航线方向为Y轴构建格网
 	// 格网大小自适应计算，重叠度计算方式为：对重叠区域中的部分，相同X值的为一列，列长为重叠大小
 	// 高差分析方式为：在重叠区中，航线1采样N个点，找出这N个点在航线2中对应高程值，
-	// 当前采用最近邻半径检索法，并将半径内的所有点的平均高程为插值高程
+	// 当前采用TIN内插法
 
 	// 哈希表方式存储网格，加快数据检索速率
 	std::unordered_map<Array2I, Single_Grim, HashArray2I> grim;
@@ -183,18 +246,19 @@ bool Quality_Check(pcl::PointCloud<pcl::PointXYZ>::Ptr flight1, pcl::PointCloud<
 	float flight2_grim_num = 0;
 	// 航线重叠区按x值相同的存储，便于计算列长度
 	std::unordered_map<int, std::pair<int, int>> overlap_line;
-	// 航线重叠区点云
-	pcl::PointCloud<pcl::PointXYZ>::Ptr cloud1_overlap(new pcl::PointCloud<pcl::PointXYZ>);
-	pcl::PointCloud<pcl::PointXYZ>::Ptr cloud2_overlap(new pcl::PointCloud<pcl::PointXYZ>);
+	// 航线1重叠区点云-采样N个点
+	pcl::PointCloud<pcl::PointXYZ>::Ptr N_sample(new pcl::PointCloud<pcl::PointXYZ>);
+	// 航线2重叠区点云
+	pcl::PointCloud<pcl::PointXYZ>::Ptr cloud_overlap(new pcl::PointCloud<pcl::PointXYZ>);
 	for (auto it = grim.begin(); it != grim.end(); ++it)
 	{
 		// 仅有航线1点的格网
 		if (it->second.idx_flight1.size() > 0 && it->second.idx_flight2.empty())
 			flight1_grim_num++;
-			// 仅有航线2点的格网
+		// 仅有航线2点的格网
 		else if (it->second.idx_flight1.empty() && it->second.idx_flight2.size() > 0)
 			flight2_grim_num++;
-			// 重叠格网
+		// 重叠格网
 		else
 		{
 			flight1_grim_num++;
@@ -212,13 +276,12 @@ bool Quality_Check(pcl::PointCloud<pcl::PointXYZ>::Ptr flight1, pcl::PointCloud<
 					overlap_line[it->first[0]].second = it->first[1];
 			}
 
-			for (const auto& idx : it->second.idx_flight1)
-			{
-				cloud1_overlap->push_back(flight1->points[idx]);
-			}
+			// 一个重叠格网中采样一个点
+			N_sample->push_back(flight1->points[it->second.idx_flight1[0]]);
+
 			for (const auto& idx : it->second.idx_flight2)
 			{
-				cloud2_overlap->push_back(flight2->points[idx]);
+				cloud_overlap->push_back(flight2->points[idx]);
 			}
 		}
 	}
@@ -236,20 +299,8 @@ bool Quality_Check(pcl::PointCloud<pcl::PointXYZ>::Ptr flight1, pcl::PointCloud<
 	}
 
 	/// 高程差异分析
-	pcl::PointCloud<pcl::PointXYZ>::Ptr N_sample(new pcl::PointCloud<pcl::PointXYZ>);
-	// 重复区域中选取N个点计算高程差异
-	int sampleSize = 10000;
-
-	// 创建随机采样对象
-	pcl::RandomSample<pcl::PointXYZ> randomSample;
-	randomSample.setInputCloud(cloud1_overlap);
-	randomSample.setSample(sampleSize);
-
-	// 执行随机采样
-	randomSample.filter(*N_sample);
-
 	pcl::KdTreeFLANN<pcl::PointXYZ> kdtree;
-	kdtree.setInputCloud(cloud2_overlap);
+	kdtree.setInputCloud(cloud_overlap);
 	std::vector<int> pointIdxRadiusSearch;
 	std::vector<float> pointRadiusSquaredDistance;
 
@@ -259,19 +310,19 @@ bool Quality_Check(pcl::PointCloud<pcl::PointXYZ>::Ptr flight1, pcl::PointCloud<
 	for (const auto& pt : N_sample->points)
 	{
 		// 检索半径为格网尺寸的一半
-		if (kdtree.radiusSearch(pt, float(grim_size) / 2, pointIdxRadiusSearch, pointRadiusSquaredDistance) > 0)
+		if (kdtree.radiusSearch(pt, grim_size, pointIdxRadiusSearch, pointRadiusSquaredDistance) > 0)
 		{
-			// 高程内插：该点半径内的所有点的平均高程
+			// 高程内插：该点半径内所有点构建TIN，判断该点落入哪个三角面片，插值计算高程
 			float pt_h = 0.0;
+			pcl::PointCloud<pcl::PointXYZ>::Ptr pt_knn(new pcl::PointCloud<pcl::PointXYZ>);
 			for (const auto& knn_idx : pointIdxRadiusSearch)
+				pt_knn->push_back(cloud_overlap->points[knn_idx]);
+			if (Ele_interpolation(pt, pt_knn, pt_h))
 			{
-				pt_h += cloud2_overlap->points[knn_idx].z;
+				auto delta_h = pt.z - pt_h;
+				avg_H += delta_h;
+				delta_H.push_back(delta_h);
 			}
-			pt_h /= pointIdxRadiusSearch.size();
-
-			auto delta_h = pt.z - pt_h;
-			avg_H += delta_h;
-			delta_H.push_back(delta_h);
 		}
 	}
 	avg_H /= delta_H.size();

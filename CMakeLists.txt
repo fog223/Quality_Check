@@ -5,8 +5,9 @@ set(CMAKE_CXX_STANDARD 11)
 
 find_package(PCL CONFIG REQUIRED)
 find_package(libLAS CONFIG REQUIRED)
+find_package(CGAL CONFIG REQUIRED)
 
 add_executable(Quality_Check main.cpp)
 
 target_include_directories(Quality_Check SYSTEM PRIVATE ${libLAS_INCLUDE_DIRS})
-target_link_libraries(Quality_Check PRIVATE ${PCL_LIBRARIES} $<$<PLATFORM_ID:Windows>:lib>las)
+target_link_libraries(Quality_Check PRIVATE ${PCL_LIBRARIES} $<$<PLATFORM_ID:Windows>:lib>las CGAL::CGAL)
